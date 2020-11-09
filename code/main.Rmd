@@ -1,0 +1,436 @@
+---
+title: "Amyotrophic lateral sclerosis (ALS) Project Report"
+author: "Minjun Park"
+date: "12/11/2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Summary
+ALS is an incurable, progressive nervous system disease that reduces functionality in the muscles, and the cause for this loss of muscle control still remains unexplained. My goal in this research to find a generalizable model that summarizes reported functional rating scores, which can infer critical stages for the current and new patients. State-of-the-art medicine can only relieve muscle cramps and delay the progression, so it is extremely important to infer how ALS will most likely to behave in the next few months. Biotechnology company Biogen requested an analysis on dataset – the collection of demographics and functional scores rated by each patient from the scale of 0 to 4 on different muscle functionalities. 
+The challenge of the study is that patients enter the trial at different stages of the disease, making it difficult to find the generalizable model. In addition, the plot of 982 patients’ longitudinal functional scores is very noisy without alignment or clustering. 
+To resolve this issue, I used curve registration and clustering of patient scores by symptom. Curve registration aligns all curves to the developmental stage of the disease. However, other challenges arose from this alignment – most patients have unique symptom duration, and aligned curves become left-censored that require imputation or interpolation for the missing domain. To resolve this issue, I applied R clustering package kml to cluster longitudinal data, which is an imputation method for trajectories and chooses the best cluster. With homogeneous patient samples and identically and independently distributed symptom durations, I can cluster the dataset with dropouts.
+After clustering the patients by symptom duration, my next step is to identify features, such as gender, age, and the use of medication (riluzole), for the clustering method, and run multiple linear regression to see which predictors are statistically significant. Potential methods for feature selection include Lasso regularization, elastic net, and random forest. 
+
+```{r}
+a <- "./alsfrs_subset.rds"
+dat <- readRDS(a)
+
+# adding new column
+dat["average_val"] <- NA 
+
+# change 5A --> 5B or 5B --> 5A
+for (i in c(1:length(dat$SUBJID))){
+   if (is.na(dat[i, 20])){
+     dat[i,20] <- dat[i, 21]
+   } 
+}
+
+for (i in c(1:length(dat$SUBJID))){
+  if (is.na(dat[i, 21])){
+    dat[i,21] <- dat[i, 20]
+  } 
+}
+
+# delete one of them
+dat$ALSFRS_Q5B <- NULL
+
+# calculating average value
+AveVal <- (dat$ALSFRS_Q1+ dat$ALSFRS_Q2+ dat$ALSFRS_Q3+ dat$ALSFRS_Q4+ 
+             dat$ALSFRS_Q5A+ dat$ALSFRS_Q6+ dat$ALSFRS_Q7+ dat$ALSFRS_Q8+ 
+             dat$ALSFRS_Q9+ dat$ALSFRS_QR1+ dat$ALSFRS_QR2+ dat$ALSFRS_QR3)/12
+# update average values
+dat$average_val <- AveVal
+
+# subset SUBJID, AVISITN, average_val
+s <- subset(dat, select = c(SUBJID, AVISITN, average_val, SYMPDUR))
+dat2 <- data.frame(s)
+
+# reshape the data -- For each ID
+alsdata <- data.frame(reshape(dat2, timevar = "AVISITN", 
+                         idvar  = c("SUBJID"),
+                         direction = "wide"))
+
+# remove sympdur multiple columns
+alsdata <- subset(alsdata, select = c(SUBJID, average_val.0, average_val.1,
+                                      average_val.2, average_val.3,
+                                      average_val.4, average_val.5,
+                                      average_val.6, average_val.7,
+                                      average_val.8, average_val.9,
+                                      average_val.10, average_val.11,
+                                      average_val.12, SYMPDUR.0))
+
+# compute maximum of symptom duration among patients: 33.34702
+max_val <- max(alsdata$SYMPDUR.0)
+
+alsdata[alsdata$SYMPDUR.0>25,]
+```
+
+There are 3 individuals(SUBJID: 1068, 1315, 4598), whose symptom duration is greater than 25. Therefore. This information will be used when I cluster the patients into different subgroups.
+
+
+## Failed Method: Alignment of patient curves
+```{r}
+alsdata2 <- t(alsdata)
+library(fda)
+
+# add additional row of session
+session <- matrix(data = c('session', 0:12, 'age'), nrow =15, ncol=1)
+alsdata3 <- cbind(alsdata2, session)
+alsdata4 <- alsdata3[-c(15),]
+colnames(alsdata4) <- as.character(unlist(alsdata4[1,]))
+alsdata4 <- alsdata4[-1,]
+
+df <- data.frame(alsdata4)
+# change df from factor to numerical values
+for (val in 1:length(df[1,])){
+  df[,val] <- as.numeric(as.character(df[,val]))
+}
+
+# temporarily change NA data to 3
+df[is.na(df)] <- 3
+
+vals <- c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA)
+for (val in 1:(length(df[1,])-1)){
+  vals <- cbind(vals, df[,val])
+}
+
+# using smooth.basisPar in FDA package
+alsgrowth <- with(df, smooth.basisPar(argvals=session, y=vals, lambda=0.1))
+# dataframe of smooth, penalty-applied data
+als_smooth <- data.frame(alsgrowth[["fd"]][["coefs"]])
+
+plot(alsgrowth$fd, xlab="Session", ylab="Average value of rating",
+     main="Smoothed curves for all 942 patients" )
+
+```
+
+```{r}
+plot(deriv(alsgrowth$fd), xlab="Session", ylab="Average value of rating",
+     main="Derivative of patient curves" )
+```
+
+```{r}
+plot(deriv(alsgrowth$fd, 2), xlab="age",
+     ylab="growth acceleration (average / session^2)",
+     main="Second derivative of patient curves" )
+```
+
+```{r}
+library(fdasrvf)
+yval <- alsgrowth[["y"]]
+
+# dataframe of smooth, penalty-applied data
+als_smooth <- data.frame(alsgrowth[["fd"]][["coefs"]])
+
+vector_size <- length(als_smooth[,1])
+
+matrix1 <- data.matrix(als_smooth, rownames.force = NA)
+
+df2 <- df[, 1:942]
+df3 <- data.matrix(df2, rownames.force = NA)
+als_align_ver2 <- align_fPCA(df3, time=(1:13), num_comp = 3, showplot = T, smooth_data = FALSE,
+                        sparam = 25, parallel = FALSE, cores = 8, MaxItr = 13)
+
+```
+
+Aligning the data using align_fPCA package. It returns original curves and warping functions that are used for alignment. 
+```{r}
+als_align_v2 <- data.frame(als_align_ver2$fn)
+als_align_v2["session"] <- c(1:13)
+row.names(als_align_v2) <- c('average_val.0', 'average_val.1', 'average_val.2', 'average_val.3', 'average_val.4', 'average_val.5', 'average_val.6', 'average_val.7', 'average_val.8', 'average_val.9', 'average_val.10', 'average_val.11', 'average_val.12')
+```
+
+```{r}
+#see how the graph is aligned
+for (i in c(1:500)){
+  plot(c(1:13), als_align_v2[1:13,i], type = 'l', col = sample(colours(), 20))
+  par(new=TRUE)
+} 
+```
+
+This registration captures only the shape of the curves, leading to very noisy graph of 500 subgroup patients. This information could not be used to interpret the model. We needed more systematic way to analyze the data -- Now we used clustering methods using symptom duration.
+
+## Alternative Method: Introducing Symptom Duration
+
+```{r}
+# additional variable sympdur
+plot(alsdata[1,15]+c(0:12), type="l", col='blue',
+     alsdata[1,c(2:14)], xlim = c(0, max_val+12), ylim = c(0,4),
+     xlab = "12 months + symptom duration", ylab = "score", main = "200 patients' average score")
+for (i in c(2:200)){
+  lines(alsdata[i,15]+c(0:12), type="l", col='blue',
+        alsdata[i,c(2:14)])
+}
+```
+
+Sample of 100 individual curves with symptom duration shifting
+
+```{r}
+# add drop-outs from the previous value
+for (i in c(1:length(alsdata$SUBJID))){
+  for (j in c(2:14)){
+    if (is.na(alsdata[i, j])){
+      alsdata[i, j] <- alsdata[i, j-1]
+    }
+  }
+}
+```
+
+
+```{r}
+## Histogram of symptom duration...
+# min: 0.6899, max: 33.34
+par(mfrow=c(1,1))
+hist(alsdata$SYMPDUR.0, breaks=c(0:34), main='histogram of symptom duration with 34 breaks', xlab = "symptom duration")
+hist(alsdata$SYMPDUR.0, breaks=10, main='histogram of symptom duration with 10 breaks', xlab = "symptom duration")
+```
+
+Individuals are evenly distributed based on the symptom duration.
+
+```{r}
+#initialize data frame
+result <- data.frame(matrix(nrow = 5, ncol = 13))
+for (i in 9:23){
+  vec = alsdata[alsdata$SYMPDUR.0 >= i & alsdata$SYMPDUR.0< (i+1),]
+  # take subset of scores only
+  score_only = vec[,c(2:14)]
+  # take average of these scores
+  ave = colMeans(score_only)
+  result[i-8,] = ave
+}
+```
+
+```{r}
+par(mfrow=c(1,2))
+colors <- heat.colors(13)
+plot(c(1:13), result[1,], ylim = c(1.9,3.5), type="l", col='blue', main="One-Month grouping", xlab='Trial time points', ylab='Mean score')
+for (i in 1:14){
+  lines(c(1:13), result[i,], ylim = c(1.9,3.5), type="l", col=colors[i], main="One-Month grouping")
+}
+
+#initialize data frame
+## this is for Two-month interval
+result2 <- data.frame(matrix(nrow = 5, ncol = 13))
+for (i in c(10,12,14,16,18,20,22,24)){
+  vec = alsdata[alsdata$SYMPDUR.0 >= (i-1) & alsdata$SYMPDUR.0< (i+1),]
+  # take subset of scores only
+  score_only = vec[,c(2:14)]
+  # take average of these scores
+  ave = colMeans(score_only)
+  result2[i-8,] = ave
+}
+
+colors <- heat.colors(13)
+plot(c(1:13), result2[1,], ylim = c(1.9,3.5), type="l", col='blue', main="Two-Month grouping", xlab='Trial time points', ylab='Mean score')
+for (i in 1:20){
+  lines(c(1:13), result2[i,], ylim = c(1.9,3.5), type="l", col=colors[i], main="One-Month grouping")
+}
+```
+
+```{r}
+# scores in each cluster group
+# make it 2 by 2 plots
+par(mfrow=c(2,2))
+
+# for interval 0-10
+newdat1 <- alsdata[which(alsdata$SYMPDUR.0 < 10),]
+max_val2 <- max(newdat1$SYMPDUR.0)
+length(newdat1[,1])
+# additional variable sympdur
+plot(newdat1[1,15]+c(0:12), type="l", col='blue',
+     newdat1[1,c(2:14)], xlim = c(0, max_val+12), ylim = c(0,4),
+     main="SYMPDUR from 0 to 10", xlab = "symptom duration" , ylab = "score")
+for (i in c(2:186)){
+  lines(newdat1[i,15]+c(0:12), type="l", col='blue',
+        newdat1[i,c(2:14)])
+}
+val = c(3.5, 3.5, 2.2, 3.3)
+a = approxfun(val, c(0:3))
+
+# interpolate data
+a = approxfun(newdat1[2,c(2:14)], c(0:12))
+a = newdat1[2,c(2:14)]
+typeof(a)
+
+# for interval 10-15
+newdat2 <- alsdata[which(alsdata$SYMPDUR.0 >= 10 & alsdata$SYMPDUR.0<15),]
+max_val2 <- max(newdat2$SYMPDUR.0)
+length(newdat2[,1])
+# additional variable sympdur
+plot(newdat2[1,15]+c(0:12), type="l", col='blue',
+     newdat2[1,c(2:14)], xlim = c(0, max_val+12), ylim = c(0,4), 
+     main="SYMPDUR from 10 to 15", xlab = "symptom duration" , ylab = "score")
+for (i in c(2:269)){
+  lines(newdat2[i,15]+c(0:12), type="l", col='blue',
+        newdat2[i,c(2:14)])
+}
+
+# for interval 15-20
+newdat3 <- alsdata[which(alsdata$SYMPDUR.0 >= 15 & alsdata$SYMPDUR.0<20),]
+max_val2 <- max(newdat3$SYMPDUR.0)
+length(newdat3[,1])
+
+# additional variable sympdur
+plot(newdat3[1,15]+c(0:12), type="l", col='blue',
+     newdat3[1,c(2:14)], xlim = c(0, max_val+12), ylim = c(0,4),
+     main='SYMPDUR from 15 to 20', xlab = "symptom duration" , ylab = "score")
+for (i in c(2:261)){
+  lines(newdat3[i,15]+c(0:12), type="l", col='blue',
+        newdat3[i,c(2:14)])
+}
+
+# for interval 20-25
+newdat4 <- alsdata[which(alsdata$SYMPDUR.0 >= 20 & alsdata$SYMPDUR.0<25),]
+max_val2 <- max(newdat4$SYMPDUR.0)
+length(newdat4[,1])
+# additional variable sympdur
+plot(newdat4[1,15]+c(0:12), type="l", col='blue',
+     newdat4[1,c(2:14)], xlim = c(0, max_val+12), ylim = c(0,4),
+     main='SYMPDUR from 15 to 20', xlab = "symptom duration" , ylab = "score")
+for (i in c(2:219)){
+  lines(newdat4[i,15]+c(0:12), type="l", col='blue',
+        newdat4[i,c(2:14)])
+}
+```
+
+This preliminary result of heatmap shows that groups with different symptom duration show disparity in average ALSFRS score. For example, Red lines and yellow lines are clearly divided in the beginning, and two groups start to blend as time goes on. Therefore, we can potentially use methods in clustering literature to identify clusters within subgroups.
+
+```{r}
+par(mfrow=c(1,2))
+# average of 13 time points 
+f_sum = sum(alsdata[1, 2:14])
+f_ave = f_sum/13
+f_symdur = alsdata[1, 15]
+plot(f_symdur, f_ave, xlim=c(0,30), ylim=c(0,4), 
+     xlab='symtom duration', ylab='average of 13 time points')
+
+for (i in 2:942){
+  # average of 13 time points for all individuals
+  sum_dat = sum(alsdata[i, 2:14])
+  ave = sum_dat/13
+  symdur = alsdata[i, 15]
+  points(symdur, ave, cex = .5)
+}
+```
+
+This graph shows the average score across the 13 time points for all patients with respect to the symptom duration. Patients show randomly distributed symptom duration and average scores.
+
+```{r}
+# first time point ONLY
+f_val = alsdata[1, 2]
+f_symdur = alsdata[1, 15]
+plot(f_symdur, f_val, xlim=c(0,30), ylim=c(0,4), 
+     xlab='symtom duration', ylab='FIRST time point score')
+
+for (i in 2:942){
+  # average of 13 time points for one individual
+  ave = alsdata[i,2]
+  symdur = alsdata[i, 15]
+  points(symdur, ave,cex = 0.5)
+}
+```
+
+This plot looks at average score for the first visit for all patients. Patients do not necessarily have lower average grade if the patient had longer symptom duration.
+
+
+```{r}
+# take the difference from second time point to the previous time point
+# group by cluster
+
+# first with symdur less than 10
+newdat1 <- alsdata[which(alsdata$SYMPDUR.0 < 10),]
+init = c()
+for (i in 2:13){
+  vec = newdat1[1, i+1] - newdat1[1, i]
+  init = append(init, vec)
+}
+time = c(1:12)
+plot(time, init, type ='l', xlab = "visit" , ylab = "score change", main = "relative change from t+1 to t")
+```
+
+This plot is one example of relative change from the previous time point to the next.
+
+```{r}
+library(kml)
+# call kml
+# for interval 0-10
+newdat1 <- alsdata[which(alsdata$SYMPDUR.0 < 10),]
+als.cld <- clusterLongData(traj=as.matrix(newdat1[,2:14]), idAll=newdat1$SUBJID, time=0:12)
+kml(als.cld,nbRedrawing=3,toPlot="both")
+s <- as.matrix(newdat1[,2:14])
+### 3. Exporting results
+### To check the best's cluster numbers
+plotAllCriterion(als.cld)
+
+# To see the best partition
+try(choice(als.cld))
+```
+
+```{r}
+# for interval 10-15
+newdat2 <- alsdata[which(alsdata$SYMPDUR.0 >= 10 & alsdata$SYMPDUR.0<15),]
+als.cld <- clusterLongData(traj=as.matrix(newdat2[,2:14]), idAll=newdat2$SUBJID, time=0:12)
+kml(als.cld,nbRedrawing=3,toPlot="both")
+s <- as.matrix(newdat2[,2:14])
+### 3. Exporting results
+### To check the best's cluster numbers
+plotAllCriterion(als.cld)
+
+# To see the best partition
+try(choice(als.cld))
+```
+
+```{r}
+# for interval 15-20
+newdat3 <- alsdata[which(alsdata$SYMPDUR.0 >= 15 & alsdata$SYMPDUR.0<20),]
+als.cld <- clusterLongData(traj=as.matrix(newdat3[,2:14]), idAll=newdat3$SUBJID, time=0:12)
+kml(als.cld,nbRedrawing=3,toPlot="both")
+s <- as.matrix(newdat3[,2:14])
+### 3. Exporting results
+### To check the best's cluster numbers
+plotAllCriterion(als.cld)
+
+# To see the best partition
+try(choice(als.cld))
+```
+
+```{r}
+# for interval 20-25
+newdat4 <- alsdata[which(alsdata$SYMPDUR.0 >= 20 & alsdata$SYMPDUR.0<25),]
+als.cld <- clusterLongData(traj=as.matrix(newdat4[,2:14]), idAll=newdat4$SUBJID, time=0:12)
+kml(als.cld,nbRedrawing=3,toPlot="both")
+s <- as.matrix(newdat4[,2:14])
+### 3. Exporting results
+### To check the best's cluster numbers
+plotAllCriterion(als.cld)
+
+# To see the best partition
+try(choice(als.cld))
+```
+
+## After the report... post-hoc analysis
+1. Combining cluster 1(interval 0-10) and cluster 3(interval 15-20) as they show similar plot
+```{r}  
+newdat1 <- alsdata[which(alsdata$SYMPDUR.0 < 10),]
+newdat3 <- alsdata[which(alsdata$SYMPDUR.0 >= 15 & alsdata$SYMPDUR.0<20),]
+comb_one_and_three <- rbind(newdat1, newdat3)
+
+als.cld <- clusterLongData(traj=as.matrix(comb_one_and_three[,2:14]), idAll=comb_one_and_three$SUBJID, time=0:12)
+kml(als.cld,nbRedrawing=3,toPlot="both")
+s <- as.matrix(comb_one_and_three[,2:14])
+### 3. Exporting results
+### To check the best's cluster numbers
+plotAllCriterion(als.cld)
+
+# To see the best partition
+try(choice(als.cld))
+als.cld
+```
+
+```{r}
+?clusterLongData
+try(choice(als.cld))
+als.cld
+```
